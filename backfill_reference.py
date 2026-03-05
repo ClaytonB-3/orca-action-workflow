@@ -18,8 +18,6 @@ from orcasound_noise.utils import Hydrophone
 
 from ambient_reference import (
     TIMEZONE,
-    WINDOW_DAYS,
-    ReferenceRow,
     compute_reference_for_day,
     date_range,
     read_existing,
@@ -53,7 +51,7 @@ def backfill_hydrophone(
             row = compute_reference_for_day(hydrophone, current)
             if row is not None:
                 new_rows.append(row)
-                print(f"  {current}: {row.rolling_reference_db:.1f} dB ({row.sample_count} samples)")
+                print(f"  {current}: {row.rolling_reference_db:.1f} dB")
             else:
                 print(f"  {current}: no data in window, skipping")
         except Exception as e:
@@ -65,9 +63,6 @@ def backfill_hydrophone(
 
     new_df = pl.DataFrame([asdict(row) for row in new_rows]).with_columns(
         pl.col("date").cast(pl.Date),
-        pl.col("sample_count").cast(pl.Int64),
-        pl.col("window_start").cast(pl.Datetime),
-        pl.col("window_end").cast(pl.Datetime),
     )
 
     if existing_df is not None:

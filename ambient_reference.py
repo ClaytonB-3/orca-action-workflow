@@ -24,11 +24,7 @@ TIMEZONE = ZoneInfo("US/Pacific")
 @dataclass
 class ReferenceRow:
     date: dt.date
-    hydrophone: str
     rolling_reference_db: float
-    sample_count: int
-    window_start: dt.datetime
-    window_end: dt.datetime
 
 
 def date_range(start: dt.date, end: dt.date):
@@ -87,11 +83,7 @@ def compute_reference_for_day(
 
     return ReferenceRow(
         date=target_date,
-        hydrophone=hydrophone.name,
         rolling_reference_db=float(ref_db),
-        sample_count=bb_df.height,
-        window_start=start_time.replace(tzinfo=None),
-        window_end=end_time.replace(tzinfo=None),
     )
 
 
@@ -123,7 +115,7 @@ def process_hydrophone(s3_client, hydrophone: Hydrophone, today: dt.date) -> int
             row = compute_reference_for_day(hydrophone, current)
             if row is not None:
                 new_rows.append(row)
-                print(f"  {current}: {row.rolling_reference_db:.1f} dB ({row.sample_count} samples)")
+                print(f"  {current}: {row.rolling_reference_db:.1f} dB")
             else:
                 print(f"  {current}: no data in window, skipping")
         except Exception as e:
@@ -135,9 +127,6 @@ def process_hydrophone(s3_client, hydrophone: Hydrophone, today: dt.date) -> int
 
     new_df = pl.DataFrame([asdict(row) for row in new_rows]).with_columns(
         pl.col("date").cast(pl.Date),
-        pl.col("sample_count").cast(pl.Int64),
-        pl.col("window_start").cast(pl.Datetime),
-        pl.col("window_end").cast(pl.Datetime),
     )
 
     if existing_df is not None:
