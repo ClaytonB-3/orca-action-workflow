@@ -1,0 +1,5 @@
+polars
+boto3
+pytz
+pyarrow
+orcasound_noise@git+https://github.com/orcasound/ambient-sound-analysis@MSDS-2026-main
