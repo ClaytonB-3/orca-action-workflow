@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 import boto3
 import polars as pl
 
-from orcasound_noise.pipeline.partitioned_accessor import PartitionedAccessor
+from orcasound_noise.analysis.partitioned_accessor import PartitionedAccessor
 from orcasound_noise.utils import Hydrophone
 
 S3_BUCKET = "acoustic-sandbox"
