@@ -66,48 +66,6 @@ def write_to_s3(s3_client, hydrophone_name: str, df: pl.DataFrame) -> None:
     print(f"  Wrote {len(df)} rows to s3://{S3_BUCKET}/{key}")
 
 
-def find_earliest_data(hydrophone: Hydrophone, today: dt.date) -> dt.date | None:
-    """Find earliest date with available data by probing progressively older dates."""
-    # Try going back up to 2 years in weekly steps, then narrow down
-    earliest_found = None
-
-    # First: coarse scan backwards in 30-day steps up to 730 days
-    for days_back in range(0, 731, 30):
-        candidate = today - dt.timedelta(days=days_back)
-        start = dt.datetime.combine(candidate, dt.time.min).replace(tzinfo=TIMEZONE)
-        end = start + dt.timedelta(days=1)
-        try:
-            accessor = PartitionedAccessor(hydrophone, start, end)
-            _, bb_lazy = accessor.get_dataframes()
-            bb_df = bb_lazy.collect()
-            if bb_df.height > 0:
-                earliest_found = candidate
-        except Exception as e:
-            print(f"  Probe {candidate}: {e}")
-
-    if earliest_found is None:
-        return None
-
-    # Fine-tune: scan forward from (earliest_found - 30 days) in daily steps
-    search_start = earliest_found - dt.timedelta(days=30)
-    for day_offset in range(31):
-        candidate = search_start + dt.timedelta(days=day_offset)
-        if candidate > today:
-            break
-        start = dt.datetime.combine(candidate, dt.time.min).replace(tzinfo=TIMEZONE)
-        end = start + dt.timedelta(days=1)
-        try:
-            accessor = PartitionedAccessor(hydrophone, start, end)
-            _, bb_lazy = accessor.get_dataframes()
-            bb_df = bb_lazy.collect()
-            if bb_df.height > 0:
-                return candidate
-        except Exception as e:
-            print(f"  Probe {candidate}: {e}")
-            continue
-
-    return earliest_found
-
 
 def compute_reference_for_day(
     hydrophone: Hydrophone, target_date: dt.date
@@ -152,14 +110,8 @@ def process_hydrophone(s3_client, hydrophone: Hydrophone, today: dt.date) -> int
         print(f"  Found existing data through {last_date}, computing from {start_date}")
     else:
         existing_df = None
-        print("  No existing data found, searching for earliest available data...")
-        earliest = find_earliest_data(hydrophone, today)
-        if earliest is None:
-            print(f"  No data found for {name}, skipping.")
-            return 0
-        # Need at least WINDOW_DAYS of data for a meaningful reference
-        start_date = earliest + dt.timedelta(days=WINDOW_DAYS)
-        print(f"  Earliest data: {earliest}, starting reference from {start_date}")
+        start_date = today - dt.timedelta(days=WINDOW_DAYS)
+        print(f"  No existing data found, starting from {start_date}")
 
     if start_date > today:
         print("  Already up to date.")
