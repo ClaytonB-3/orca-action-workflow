@@ -10,6 +10,7 @@ Usage:
 import argparse
 import datetime as dt
 import traceback
+from dataclasses import asdict
 
 import boto3
 import polars as pl
@@ -29,12 +30,10 @@ def backfill_hydrophone(
     s3_client, hydrophone: Hydrophone, start: dt.date, end: dt.date
 ) -> int:
     """Backfill reference levels for a hydrophone over a date range."""
-    from dataclasses import asdict
-
     name = hydrophone.name
     print(f"\nBackfilling {name} from {start} to {end}...")
 
-    existing_df = read_existing(s3_client, name)
+    existing_df = read_existing(s3_client, hydrophone)
     existing_dates: set[dt.date] = set()
     if existing_df is not None and len(existing_df) > 0:
         dates_col = existing_df.select(pl.col("date")).to_series()
@@ -51,7 +50,7 @@ def backfill_hydrophone(
             row = compute_reference_for_day(hydrophone, current)
             if row is not None:
                 new_rows.append(row)
-                print(f"  {current}: {row.rolling_reference_db:.1f} dB")
+                print(f"  {current}: bb={row.bb_ref:.1f} comm={row.comm_bb_ref:.1f} ship={row.ship_bb_ref:.1f} dB")
             else:
                 print(f"  {current}: no data in window, skipping")
         except Exception as e:
@@ -70,7 +69,7 @@ def backfill_hydrophone(
     else:
         combined = new_df.sort("date")
 
-    write_to_s3(s3_client, name, combined)
+    write_to_s3(s3_client, hydrophone, combined)
     return len(new_rows)
 
 
