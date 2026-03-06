@@ -19,6 +19,9 @@ S3_BUCKET = "acoustic-sandbox"
 S3_PREFIX = "ambient-sound-analysis/data/rolling_reference"
 WINDOW_DAYS = 7
 TIMEZONE = ZoneInfo("US/Pacific")
+BB_REF = 1e-6  # 1 μPa reference for dB conversion
+BB_FREQ_LOW = 20
+BB_FREQ_HIGH = 20000
 
 
 @dataclass
@@ -71,12 +74,14 @@ def compute_reference_for_day(
     start_time = end_time - dt.timedelta(days=WINDOW_DAYS)
 
     accessor = PartitionedAccessor(hydrophone, start_time, end_time)
-    _, bb_df = accessor.get_dataframes()
+    bb_df = accessor.get_broadband(
+        freq_low=BB_FREQ_LOW, freq_high=BB_FREQ_HIGH, ref=BB_REF
+    ).collect()
 
     if bb_df.height == 0:
         return None
 
-    ref_db = bb_df.select(pl.col("0").quantile(0.05)).item()
+    ref_db = bb_df.select(pl.col("calc_bb").quantile(0.05)).item()
 
     return ReferenceRow(
         date=target_date,
