@@ -67,14 +67,11 @@ def compute_reference_for_day(
     hydrophone: Hydrophone, target_date: dt.date
 ) -> ReferenceRow | None:
     """Compute 5th percentile broadband dB for 7-day window ending on target_date."""
-    end_time = dt.datetime.combine(
-        target_date + dt.timedelta(days=1), dt.time.min
-    ).replace(tzinfo=TIMEZONE)
+    end_time = dt.datetime.combine(target_date + dt.timedelta(days=1), dt.time.min)
     start_time = end_time - dt.timedelta(days=WINDOW_DAYS)
 
     accessor = PartitionedAccessor(hydrophone, start_time, end_time)
-    _, bb_lazy = accessor.get_dataframes()
-    bb_df = bb_lazy.collect()
+    _, bb_df = accessor.get_dataframes()
 
     if bb_df.height == 0:
         return None
