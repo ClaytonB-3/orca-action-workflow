@@ -6,6 +6,7 @@ Produces per-hydrophone ref files matching the schema expected by
 the pipeline (PR #79): date, bb_ref, comm_bb_ref, ship_bb_ref.
 """
 
+import argparse
 import datetime as dt
 import io
 import traceback
@@ -15,10 +16,11 @@ from zoneinfo import ZoneInfo
 import boto3
 import polars as pl
 
-from orcasound_noise.analysis.partitioned_accessor import PartitionedAccessor
 from orcasound_noise.utils import Hydrophone
 
 S3_BUCKET = "acoustic-sandbox"
+S3_DATA_PREFIX = "ambient-sound-analysis/data_3.0"
+TEST_PREFIX = "test/ambient_reference"
 WINDOW_DAYS = 7
 TIMEZONE = ZoneInfo("US/Pacific")
 
@@ -26,6 +28,7 @@ TIMEZONE = ZoneInfo("US/Pacific")
 BB_COL = "bb_o"
 COMM_BB_COL = "comm_bb_o"
 SHIP_BB_COL = "ship_bb_o"
+TIMESTAMP_COL = "ind"
 
 
 @dataclass
@@ -44,16 +47,32 @@ def date_range(start: dt.date, end: dt.date):
         current += dt.timedelta(days=1)
 
 
-def s3_ref_key(hydrophone: Hydrophone) -> str:
+def s3_ref_key(hydrophone: Hydrophone, test_mode: bool = False) -> str:
     """S3 key matching the path the pipeline reads refs from."""
     name = hydrophone.value.name
-    folder = hydrophone.value.save_folder
-    return f"{folder}/ref/hydrophone={name}/{name}_refs.parquet"
+    key = f"{S3_DATA_PREFIX}/ref/hydrophone={name}/{name}_refs.parquet"
+    if test_mode:
+        key = f"{TEST_PREFIX}/{key}"
+    return key
 
 
-def read_existing(s3_client, hydrophone: Hydrophone) -> pl.DataFrame | None:
+def bb_paths_for_range(hydrophone: Hydrophone, start: dt.date, end: dt.date) -> list[str]:
+    """Build S3 glob paths for broadband parquets over a date range."""
+    name = hydrophone.value.name
+    paths = []
+    d = start
+    while d <= end:
+        paths.append(
+            f"s3://{S3_BUCKET}/{S3_DATA_PREFIX}/broadband/hydrophone={name}"
+            f"/year={d.year}/month={d.month:02d}/day={d.day:02d}/*.parquet"
+        )
+        d += dt.timedelta(days=1)
+    return paths
+
+
+def read_existing(s3_client, hydrophone: Hydrophone, test_mode: bool = False) -> pl.DataFrame | None:
     """Read existing reference parquet from S3, or return None."""
-    key = s3_ref_key(hydrophone)
+    key = s3_ref_key(hydrophone, test_mode)
     try:
         obj = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
         data = obj["Body"].read()
@@ -65,9 +84,9 @@ def read_existing(s3_client, hydrophone: Hydrophone) -> pl.DataFrame | None:
         return None
 
 
-def write_to_s3(s3_client, hydrophone: Hydrophone, df: pl.DataFrame) -> None:
+def write_to_s3(s3_client, hydrophone: Hydrophone, df: pl.DataFrame, test_mode: bool = False) -> None:
     """Write reference parquet to S3."""
-    key = s3_ref_key(hydrophone)
+    key = s3_ref_key(hydrophone, test_mode)
     buf = io.BytesIO()
     df.write_parquet(buf)
     s3_client.put_object(Bucket=S3_BUCKET, Key=key, Body=buf.getvalue())
@@ -81,8 +100,15 @@ def compute_reference_for_day(
     end_time = dt.datetime.combine(target_date + dt.timedelta(days=1), dt.time.min)
     start_time = end_time - dt.timedelta(days=WINDOW_DAYS)
 
-    accessor = PartitionedAccessor(hydrophone, start_time, end_time)
-    _, bb_df = accessor.get_dataframes()
+    paths = bb_paths_for_range(hydrophone, start_time.date(), end_time.date())
+    try:
+        bb_df = (
+            pl.scan_parquet(paths, storage_options={"aws_region": "us-west-2"})
+            .filter(pl.col(TIMESTAMP_COL).is_between(start_time, end_time))
+            .collect()
+        )
+    except Exception:
+        return None
 
     if bb_df.height == 0:
         return None
@@ -101,12 +127,12 @@ def compute_reference_for_day(
     )
 
 
-def process_hydrophone(s3_client, hydrophone: Hydrophone, today: dt.date) -> int:
+def process_hydrophone(s3_client, hydrophone: Hydrophone, today: dt.date, test_mode: bool = False) -> int:
     """Process a single hydrophone. Returns number of new rows added."""
     name = hydrophone.name
     print(f"\nProcessing {name}...")
 
-    existing_df = read_existing(s3_client, hydrophone)
+    existing_df = read_existing(s3_client, hydrophone, test_mode)
 
     if existing_df is not None and len(existing_df) > 0:
         last_date = existing_df.select(pl.col("date").max()).item()
@@ -148,13 +174,20 @@ def process_hydrophone(s3_client, hydrophone: Hydrophone, today: dt.date) -> int
     else:
         combined = new_df
 
-    write_to_s3(s3_client, hydrophone, combined)
+    write_to_s3(s3_client, hydrophone, combined, test_mode)
     return len(new_rows)
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Compute rolling broadband reference levels")
+    parser.add_argument("--test", action="store_true",
+                        help=f"Write to test prefix ({TEST_PREFIX}/) instead of production paths")
+    args = parser.parse_args()
+
     print("=" * 60)
     print("Rolling Broadband Reference Level Computation")
+    if args.test:
+        print(f"*** TEST MODE — writing to {TEST_PREFIX}/ ***")
     print("=" * 60)
 
     s3_client = boto3.client("s3")
@@ -163,8 +196,10 @@ def main():
 
     summary = {}
     for hydrophone in Hydrophone:
+        if hydrophone.name == "HPhoneTup":
+            continue
         try:
-            count = process_hydrophone(s3_client, hydrophone, today)
+            count = process_hydrophone(s3_client, hydrophone, today, args.test)
             summary[hydrophone.name] = count
         except Exception:
             print(f"\nERROR processing {hydrophone.name}:")
