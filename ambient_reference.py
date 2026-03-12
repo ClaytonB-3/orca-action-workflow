@@ -50,7 +50,7 @@ def date_range(start: dt.date, end: dt.date):
 def s3_ref_key(hydrophone: Hydrophone, test_mode: bool = False) -> str:
     """S3 key matching the path the pipeline reads refs from."""
     name = hydrophone.value.name
-    key = f"{S3_DATA_PREFIX}/ref/hydrophone={name}/{name}_refs.parquet"
+    key = f"{S3_DATA_PREFIX}/ref/hydrophone={name}/{name}_ref.parquet"
     if test_mode:
         key = f"{TEST_PREFIX}/{key}"
     return key
@@ -91,6 +91,59 @@ def write_to_s3(s3_client, hydrophone: Hydrophone, df: pl.DataFrame, test_mode: 
     df.write_parquet(buf)
     s3_client.put_object(Bucket=S3_BUCKET, Key=key, Body=buf.getvalue())
     print(f"  Wrote {len(df)} rows to s3://{S3_BUCKET}/{key}")
+
+
+def find_earliest_data_date(s3_client, hydrophone: Hydrophone) -> dt.date | None:
+    """Find the earliest date with broadband data via S3 listing."""
+    name = hydrophone.value.name
+    prefix = f"{S3_DATA_PREFIX}/broadband/hydrophone={name}/year="
+    resp = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix, MaxKeys=1)
+    if resp.get("KeyCount", 0) == 0:
+        return None
+    # First key is the earliest (S3 lists lexicographically)
+    # e.g. .../year=2026/month=03/day=01/file.parquet
+    key = resp["Contents"][0]["Key"]
+    parts = key.split("/")
+    year = month = day = None
+    for part in parts:
+        if part.startswith("year="):
+            year = int(part.split("=")[1])
+        elif part.startswith("month="):
+            month = int(part.split("=")[1])
+        elif part.startswith("day="):
+            day = int(part.split("=")[1])
+    if year and month and day:
+        return dt.date(year, month, day)
+    return None
+
+
+def compute_bootstrap_reference(
+    hydrophone: Hydrophone, earliest_date: dt.date
+) -> tuple[float, float, float] | None:
+    """Compute 5th percentile over the first WINDOW_DAYS days of data."""
+    start_time = dt.datetime.combine(earliest_date, dt.time.min)
+    end_time = dt.datetime.combine(earliest_date + dt.timedelta(days=WINDOW_DAYS), dt.time.min)
+
+    paths = bb_paths_for_range(hydrophone, earliest_date, earliest_date + dt.timedelta(days=WINDOW_DAYS - 1))
+    try:
+        bb_df = (
+            pl.scan_parquet(paths, storage_options={"aws_region": "us-west-2"})
+            .filter(pl.col(TIMESTAMP_COL).is_between(start_time, end_time))
+            .collect()
+        )
+    except Exception:
+        return None
+
+    if bb_df.height == 0:
+        return None
+
+    quantiles = bb_df.select(
+        pl.col(BB_COL).quantile(0.05).alias("bb_ref"),
+        pl.col(COMM_BB_COL).quantile(0.05).alias("comm_bb_ref"),
+        pl.col(SHIP_BB_COL).quantile(0.05).alias("ship_bb_ref"),
+    ).row(0)
+
+    return (float(quantiles[0]), float(quantiles[1]), float(quantiles[2]))
 
 
 def compute_reference_for_day(
@@ -135,11 +188,18 @@ def process_hydrophone(s3_client, hydrophone: Hydrophone, today: dt.date, test_m
     existing_df = read_existing(s3_client, hydrophone, test_mode)
 
     if existing_df is not None and len(existing_df) > 0:
-        last_date = existing_df.select(pl.col("date").max()).item()
-        if isinstance(last_date, dt.datetime):
-            last_date = last_date.date()
-        start_date = last_date + dt.timedelta(days=1)
-        print(f"  Found existing data through {last_date}, computing from {start_date}")
+        # Keep only historical rows (before today); we'll recompute today and forward
+        existing_df = existing_df.filter(pl.col("date") < today)
+        if len(existing_df) > 0:
+            last_date = existing_df.select(pl.col("date").max()).item()
+            if isinstance(last_date, dt.datetime):
+                last_date = last_date.date()
+            start_date = last_date + dt.timedelta(days=1)
+            print(f"  Found existing data through {last_date}, computing from {start_date}")
+        else:
+            existing_df = None
+            start_date = today - dt.timedelta(days=WINDOW_DAYS)
+            print(f"  No historical data before today, starting from {start_date}")
     else:
         existing_df = None
         start_date = today - dt.timedelta(days=WINDOW_DAYS)
@@ -149,15 +209,37 @@ def process_hydrophone(s3_client, hydrophone: Hydrophone, today: dt.date, test_m
         print("  Already up to date.")
         return 0
 
+    # Find earliest data date and compute bootstrap reference for early days
+    earliest_date = find_earliest_data_date(s3_client, hydrophone)
+    bootstrap_ref = None
+    rolling_start_date = None
+    if earliest_date is not None:
+        rolling_start_date = earliest_date + dt.timedelta(days=WINDOW_DAYS)
+        if start_date < rolling_start_date:
+            bootstrap_ref = compute_bootstrap_reference(hydrophone, earliest_date)
+            if bootstrap_ref:
+                print(f"  Bootstrap ref (first {WINDOW_DAYS} days from {earliest_date}): "
+                      f"bb={bootstrap_ref[0]:.1f} comm={bootstrap_ref[1]:.1f} ship={bootstrap_ref[2]:.1f} dB")
+
     new_rows = []
     for current in date_range(start_date, today):
         try:
-            row = compute_reference_for_day(hydrophone, current)
-            if row is not None:
+            if rolling_start_date and current < rolling_start_date and bootstrap_ref:
+                row = ReferenceRow(
+                    date=current,
+                    bb_ref=bootstrap_ref[0],
+                    comm_bb_ref=bootstrap_ref[1],
+                    ship_bb_ref=bootstrap_ref[2],
+                )
                 new_rows.append(row)
-                print(f"  {current}: bb={row.bb_ref:.1f} comm={row.comm_bb_ref:.1f} ship={row.ship_bb_ref:.1f} dB")
+                print(f"  {current}: bb={row.bb_ref:.1f} comm={row.comm_bb_ref:.1f} ship={row.ship_bb_ref:.1f} dB (bootstrap)")
             else:
-                print(f"  {current}: no data in window, skipping")
+                row = compute_reference_for_day(hydrophone, current)
+                if row is not None:
+                    new_rows.append(row)
+                    print(f"  {current}: bb={row.bb_ref:.1f} comm={row.comm_bb_ref:.1f} ship={row.ship_bb_ref:.1f} dB")
+                else:
+                    print(f"  {current}: no data in window, skipping")
         except Exception as e:
             print(f"  {current}: error - {e}")
 
