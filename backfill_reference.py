@@ -85,7 +85,7 @@ def parse_args():
     )
     parser.add_argument(
         "--hydrophone", type=str, default=None,
-        help=f"Hydrophone name (e.g. BUSH_POINT). Defaults to all. Options: {', '.join(h.name for h in Hydrophone)}",
+        help=f"Hydrophone name (e.g. BUSH_POINT). Defaults to all. Options: {', '.join(h.name for h in Hydrophone if h.name != 'HPhoneTup')}",
     )
     return parser.parse_args()
 
@@ -98,7 +98,7 @@ def main():
     if args.hydrophone:
         hydrophones = [Hydrophone[args.hydrophone]]
     else:
-        hydrophones = list(Hydrophone)
+        hydrophones = [h for h in Hydrophone if h.name != "HPhoneTup"]
 
     print(f"Backfill range: {args.start} to {end}")
     print(f"Hydrophones: {', '.join(h.name for h in hydrophones)}")

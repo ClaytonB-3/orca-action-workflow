@@ -128,10 +128,11 @@ def compute_bootstrap_reference(
     try:
         bb_df = (
             pl.scan_parquet(paths, storage_options={"aws_region": "us-west-2"})
-            .filter(pl.col(TIMESTAMP_COL).is_between(start_time, end_time))
+            .filter(pl.col(TIMESTAMP_COL).is_between(start_time, end_time, closed="left"))
             .collect()
         )
-    except Exception:
+    except Exception as e:
+        print(f"  Warning: bootstrap computation failed: {e}")
         return None
 
     if bb_df.height == 0:
@@ -157,10 +158,11 @@ def compute_reference_for_day(
     try:
         bb_df = (
             pl.scan_parquet(paths, storage_options={"aws_region": "us-west-2"})
-            .filter(pl.col(TIMESTAMP_COL).is_between(start_time, end_time))
+            .filter(pl.col(TIMESTAMP_COL).is_between(start_time, end_time, closed="left"))
             .collect()
         )
-    except Exception:
+    except Exception as e:
+        print(f"  Warning: scan_parquet failed for {hydrophone.value.name} on {target_date}: {e}")
         return None
 
     if bb_df.height == 0:
