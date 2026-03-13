@@ -2,6 +2,11 @@
 Compute rolling 7-day broadband reference levels (5th percentile)
 for all Orcasound hydrophones and write results to S3.
 
+Uses the most recent 604,800 data points (7 days at 1-second resolution)
+ending at "now", looking back up to 14 calendar days to find enough data.
+Stores the result under tomorrow's date so the PSD pipeline always has a
+ref value available for any day it runs.
+
 Produces per-hydrophone ref files matching the schema expected by
 the pipeline (PR #79): date, bb_ref, comm_bb_ref, ship_bb_ref.
 """
@@ -22,6 +27,8 @@ S3_BUCKET = "acoustic-sandbox"
 S3_DATA_PREFIX = "ambient-sound-analysis/data_3.0"
 TEST_PREFIX = "test/ambient_reference"
 WINDOW_DAYS = 7
+TARGET_ROWS = WINDOW_DAYS * 24 * 60 * 60  # 604,800 seconds of data
+MAX_LOOKBACK_DAYS = 14
 TIMEZONE = ZoneInfo("US/Pacific")
 
 # data_3.0 broadband columns
@@ -38,13 +45,6 @@ class ReferenceRow:
     comm_bb_ref: float
     ship_bb_ref: float
 
-
-def date_range(start: dt.date, end: dt.date):
-    """Yield dates from start through end inclusive."""
-    current = start
-    while current <= end:
-        yield current
-        current += dt.timedelta(days=1)
 
 
 def s3_ref_key(hydrophone: Hydrophone, test_mode: bool = False) -> str:
@@ -147,26 +147,47 @@ def compute_bootstrap_reference(
     return (float(quantiles[0]), float(quantiles[1]), float(quantiles[2]))
 
 
-def compute_reference_for_day(
-    hydrophone: Hydrophone, target_date: dt.date
+def compute_reference(
+    hydrophone: Hydrophone, now: dt.datetime, ref_date: dt.date
 ) -> ReferenceRow | None:
-    """Compute 5th percentile for bb, comm, and ship bands over a 7-day window."""
-    end_time = dt.datetime.combine(target_date + dt.timedelta(days=1), dt.time.min)
-    start_time = end_time - dt.timedelta(days=WINDOW_DAYS)
+    """Compute 5th percentile over the most recent TARGET_ROWS data points.
 
-    paths = bb_paths_for_range(hydrophone, start_time.date(), end_time.date())
-    try:
-        bb_df = (
-            pl.scan_parquet(paths, storage_options={"aws_region": "us-west-2"})
-            .filter(pl.col(TIMESTAMP_COL).is_between(start_time, end_time, closed="left"))
-            .collect()
+    Loads data backward from `now`, expanding the calendar window day-by-day
+    up to MAX_LOOKBACK_DAYS. If not enough rows are found, logs a warning
+    and uses whatever data is available.
+    """
+    name = hydrophone.value.name
+
+    # Strip timezone for filtering — parquet ind column is naive datetime[ns]
+    now_naive = now.replace(tzinfo=None)
+
+    # Start with WINDOW_DAYS and expand if needed
+    for lookback in range(WINDOW_DAYS, MAX_LOOKBACK_DAYS + 1):
+        start_time = now_naive - dt.timedelta(days=lookback)
+        paths = bb_paths_for_range(hydrophone, start_time.date(), now_naive.date())
+        try:
+            bb_df = (
+                pl.scan_parquet(paths, storage_options={"aws_region": "us-west-2"})
+                .filter(pl.col(TIMESTAMP_COL).is_between(start_time, now_naive, closed="left"))
+                .sort(TIMESTAMP_COL, descending=True)
+                .head(TARGET_ROWS)
+                .collect()
+            )
+        except Exception as e:
+            print(f"  Warning: scan_parquet failed for {name} (lookback={lookback}d): {e}")
+            return None
+
+        if bb_df.height >= TARGET_ROWS:
+            print(f"  Collected {bb_df.height} rows ({lookback}d lookback)")
+            break
+    else:
+        # Exhausted MAX_LOOKBACK_DAYS
+        if bb_df.height == 0:
+            return None
+        print(
+            f"  WARNING: only {bb_df.height}/{TARGET_ROWS} rows found after "
+            f"{MAX_LOOKBACK_DAYS}d lookback for {name} — significant data gap likely"
         )
-    except Exception as e:
-        print(f"  Warning: scan_parquet failed for {hydrophone.value.name} on {target_date}: {e}")
-        return None
-
-    if bb_df.height == 0:
-        return None
 
     quantiles = bb_df.select(
         pl.col(BB_COL).quantile(0.05).alias("bb_ref"),
@@ -175,91 +196,70 @@ def compute_reference_for_day(
     ).row(0)
 
     return ReferenceRow(
-        date=target_date,
+        date=ref_date,
         bb_ref=float(quantiles[0]),
         comm_bb_ref=float(quantiles[1]),
         ship_bb_ref=float(quantiles[2]),
     )
 
 
-def process_hydrophone(s3_client, hydrophone: Hydrophone, today: dt.date, test_mode: bool = False) -> int:
-    """Process a single hydrophone. Returns number of new rows added."""
+def process_hydrophone(
+    s3_client, hydrophone: Hydrophone, now: dt.datetime, tomorrow: dt.date, test_mode: bool = False
+) -> int:
+    """Process a single hydrophone. Computes one ref row for tomorrow. Returns 1 on success, 0 otherwise."""
     name = hydrophone.name
     print(f"\nProcessing {name}...")
 
     existing_df = read_existing(s3_client, hydrophone, test_mode)
 
+    # Keep all rows except tomorrow (we'll recompute it)
     if existing_df is not None and len(existing_df) > 0:
-        # Keep only historical rows (before today); we'll recompute today and forward
-        existing_df = existing_df.filter(pl.col("date") < today)
-        if len(existing_df) > 0:
-            last_date = existing_df.select(pl.col("date").max()).item()
-            if isinstance(last_date, dt.datetime):
-                last_date = last_date.date()
-            start_date = last_date + dt.timedelta(days=1)
-            print(f"  Found existing data through {last_date}, computing from {start_date}")
-        else:
-            existing_df = None
-            start_date = today - dt.timedelta(days=WINDOW_DAYS)
-            print(f"  No historical data before today, starting from {start_date}")
+        existing_df = existing_df.filter(pl.col("date") != tomorrow)
+        print(f"  Existing ref has {len(existing_df)} rows (excluding tomorrow)")
     else:
         existing_df = None
-        start_date = today - dt.timedelta(days=WINDOW_DAYS)
-        print(f"  No existing data found, starting from {start_date}")
+        print("  No existing ref data found")
 
-    if start_date > today:
-        print("  Already up to date.")
-        return 0
-
-    # Find earliest data date and compute bootstrap reference for early days
+    # Check if we have enough data history for a rolling window
     earliest_date = find_earliest_data_date(s3_client, hydrophone)
-    bootstrap_ref = None
-    rolling_start_date = None
-    if earliest_date is not None:
-        rolling_start_date = earliest_date + dt.timedelta(days=WINDOW_DAYS)
-        if start_date < rolling_start_date:
-            bootstrap_ref = compute_bootstrap_reference(hydrophone, earliest_date)
-            if bootstrap_ref:
-                print(f"  Bootstrap ref (first {WINDOW_DAYS} days from {earliest_date}): "
-                      f"bb={bootstrap_ref[0]:.1f} comm={bootstrap_ref[1]:.1f} ship={bootstrap_ref[2]:.1f} dB")
-
-    new_rows = []
-    for current in date_range(start_date, today):
-        try:
-            if rolling_start_date and current < rolling_start_date and bootstrap_ref:
-                row = ReferenceRow(
-                    date=current,
-                    bb_ref=bootstrap_ref[0],
-                    comm_bb_ref=bootstrap_ref[1],
-                    ship_bb_ref=bootstrap_ref[2],
-                )
-                new_rows.append(row)
-                print(f"  {current}: bb={row.bb_ref:.1f} comm={row.comm_bb_ref:.1f} ship={row.ship_bb_ref:.1f} dB (bootstrap)")
-            else:
-                row = compute_reference_for_day(hydrophone, current)
-                if row is not None:
-                    new_rows.append(row)
-                    print(f"  {current}: bb={row.bb_ref:.1f} comm={row.comm_bb_ref:.1f} ship={row.ship_bb_ref:.1f} dB")
-                else:
-                    print(f"  {current}: no data in window, skipping")
-        except Exception as e:
-            print(f"  {current}: error - {e}")
-
-    if not new_rows:
-        print(f"  No new data computed for {name}.")
+    if earliest_date is None:
+        print(f"  No broadband data found for {name}, skipping")
         return 0
 
-    new_df = pl.DataFrame([asdict(row) for row in new_rows]).with_columns(
+    rolling_start_date = earliest_date + dt.timedelta(days=WINDOW_DAYS)
+    if now.date() < rolling_start_date:
+        # Not enough history — use bootstrap (5th percentile of all available data)
+        bootstrap_ref = compute_bootstrap_reference(hydrophone, earliest_date)
+        if bootstrap_ref is None:
+            print(f"  Bootstrap computation failed for {name}, skipping")
+            return 0
+        row = ReferenceRow(
+            date=tomorrow,
+            bb_ref=bootstrap_ref[0],
+            comm_bb_ref=bootstrap_ref[1],
+            ship_bb_ref=bootstrap_ref[2],
+        )
+        print(f"  {tomorrow}: bb={row.bb_ref:.1f} comm={row.comm_bb_ref:.1f} "
+              f"ship={row.ship_bb_ref:.1f} dB (bootstrap)")
+    else:
+        row = compute_reference(hydrophone, now, tomorrow)
+        if row is None:
+            print(f"  No data found for {name}, skipping")
+            return 0
+        print(f"  {tomorrow}: bb={row.bb_ref:.1f} comm={row.comm_bb_ref:.1f} "
+              f"ship={row.ship_bb_ref:.1f} dB")
+
+    new_df = pl.DataFrame([asdict(row)]).with_columns(
         pl.col("date").cast(pl.Date),
     )
 
-    if existing_df is not None:
+    if existing_df is not None and len(existing_df) > 0:
         combined = pl.concat([existing_df, new_df])
     else:
         combined = new_df
 
     write_to_s3(s3_client, hydrophone, combined, test_mode)
-    return len(new_rows)
+    return 1
 
 
 def main():
@@ -275,15 +275,17 @@ def main():
     print("=" * 60)
 
     s3_client = boto3.client("s3")
-    today = dt.datetime.now(TIMEZONE).date()
-    print(f"Today: {today}")
+    now = dt.datetime.now(TIMEZONE)
+    tomorrow = (now + dt.timedelta(days=1)).date()
+    print(f"Now: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    print(f"Computing ref for: {tomorrow}")
 
     summary = {}
     for hydrophone in Hydrophone:
         if hydrophone.name == "HPhoneTup":
             continue
         try:
-            count = process_hydrophone(s3_client, hydrophone, today, args.test)
+            count = process_hydrophone(s3_client, hydrophone, now, tomorrow, args.test)
             summary[hydrophone.name] = count
         except Exception:
             print(f"\nERROR processing {hydrophone.name}:")
