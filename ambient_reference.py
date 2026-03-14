@@ -23,8 +23,6 @@ import polars as pl
 
 from orcasound_noise.utils import Hydrophone
 
-S3_BUCKET = "acoustic-sandbox"
-S3_DATA_PREFIX = "ambient-sound-analysis/data_3.0"
 TEST_PREFIX = "test/ambient_reference"
 WINDOW_DAYS = 7
 TARGET_ROWS = WINDOW_DAYS * 24 * 60 * 60  # 604,800 seconds of data
@@ -50,7 +48,8 @@ class ReferenceRow:
 def s3_ref_key(hydrophone: Hydrophone, test_mode: bool = False) -> str:
     """S3 key matching the path the pipeline reads refs from."""
     name = hydrophone.value.name
-    key = f"{S3_DATA_PREFIX}/ref/hydrophone={name}/{name}_ref.parquet"
+    save_folder = hydrophone.value.save_folder
+    key = f"{save_folder}/ref/hydrophone={name}/{name}_ref.parquet"
     if test_mode:
         key = f"{TEST_PREFIX}/{key}"
     return key
@@ -59,11 +58,13 @@ def s3_ref_key(hydrophone: Hydrophone, test_mode: bool = False) -> str:
 def bb_paths_for_range(hydrophone: Hydrophone, start: dt.date, end: dt.date) -> list[str]:
     """Build S3 glob paths for broadband parquets over a date range."""
     name = hydrophone.value.name
+    bucket = hydrophone.value.save_bucket
+    folder = hydrophone.value.save_folder
     paths = []
     d = start
     while d <= end:
         paths.append(
-            f"s3://{S3_BUCKET}/{S3_DATA_PREFIX}/broadband/hydrophone={name}"
+            f"s3://{bucket}/{folder}/broadband/hydrophone={name}"
             f"/year={d.year}/month={d.month:02d}/day={d.day:02d}/*.parquet"
         )
         d += dt.timedelta(days=1)
@@ -72,9 +73,10 @@ def bb_paths_for_range(hydrophone: Hydrophone, start: dt.date, end: dt.date) -> 
 
 def read_existing(s3_client, hydrophone: Hydrophone, test_mode: bool = False) -> pl.DataFrame | None:
     """Read existing reference parquet from S3, or return None."""
+    bucket = hydrophone.value.save_bucket
     key = s3_ref_key(hydrophone, test_mode)
     try:
-        obj = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
+        obj = s3_client.get_object(Bucket=bucket, Key=key)
         data = obj["Body"].read()
         return pl.read_parquet(io.BytesIO(data))
     except s3_client.exceptions.NoSuchKey:
@@ -86,18 +88,21 @@ def read_existing(s3_client, hydrophone: Hydrophone, test_mode: bool = False) ->
 
 def write_to_s3(s3_client, hydrophone: Hydrophone, df: pl.DataFrame, test_mode: bool = False) -> None:
     """Write reference parquet to S3."""
+    bucket = hydrophone.value.save_bucket
     key = s3_ref_key(hydrophone, test_mode)
     buf = io.BytesIO()
     df.write_parquet(buf)
-    s3_client.put_object(Bucket=S3_BUCKET, Key=key, Body=buf.getvalue())
-    print(f"  Wrote {len(df)} rows to s3://{S3_BUCKET}/{key}")
+    s3_client.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
+    print(f"  Wrote {len(df)} rows to s3://{bucket}/{key}")
 
 
 def find_earliest_data_date(s3_client, hydrophone: Hydrophone) -> dt.date | None:
     """Find the earliest date with broadband data via S3 listing."""
     name = hydrophone.value.name
-    prefix = f"{S3_DATA_PREFIX}/broadband/hydrophone={name}/year="
-    resp = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix, MaxKeys=1)
+    bucket = hydrophone.value.save_bucket
+    folder = hydrophone.value.save_folder
+    prefix = f"{folder}/broadband/hydrophone={name}/year="
+    resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
     if resp.get("KeyCount", 0) == 0:
         return None
     # First key is the earliest (S3 lists alphabetically by key)
@@ -117,7 +122,7 @@ def find_earliest_data_date(s3_client, hydrophone: Hydrophone) -> dt.date | None
     return None
 
 
-def compute_bootstrap_reference(
+def compute_initial_reference(
     hydrophone: Hydrophone, earliest_date: dt.date
 ) -> tuple[float, float, float] | None:
     """Compute 5th percentile over the first WINDOW_DAYS days of data.
@@ -164,8 +169,8 @@ def compute_reference(
     # Strip timezone for filtering — parquet ind column is naive datetime[ns]
     now_naive = now.replace(tzinfo=None)
 
-    # Start with WINDOW_DAYS and expand if needed
-    for lookback in range(WINDOW_DAYS, MAX_LOOKBACK_DAYS + 1):
+    # Start with WINDOW_DAYS + 1 to account for partial current day
+    for lookback in range(WINDOW_DAYS + 1, MAX_LOOKBACK_DAYS + 1):
         start_time = now_naive - dt.timedelta(days=lookback)
         paths = bb_paths_for_range(hydrophone, start_time.date(), now_naive.date())
         try:
@@ -231,8 +236,8 @@ def process_hydrophone(
 
     rolling_start_date = earliest_date + dt.timedelta(days=WINDOW_DAYS)
     if now.date() < rolling_start_date:
-        # Not enough history — use bootstrap (5th percentile of all available data)
-        bootstrap_ref = compute_bootstrap_reference(hydrophone, earliest_date)
+        # Not enough history — use 5th percentile of first WINDOW_DAYS days
+        bootstrap_ref = compute_initial_reference(hydrophone, earliest_date)
         if bootstrap_ref is None:
             print(f"  Bootstrap computation failed for {name}, skipping")
             return 0
