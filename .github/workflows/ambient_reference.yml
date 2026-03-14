@@ -28,4 +28,4 @@ jobs:
         aws-region: us-west-2
 
     - name: Compute rolling reference levels
-      run: python ambient_reference.py
+      run: python ambient-sound-analysis_scripts/ambient_reference.py
