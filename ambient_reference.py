@@ -8,7 +8,7 @@ Stores the result under tomorrow's date so the PSD pipeline always has a
 ref value available for any day it runs.
 
 Produces per-hydrophone ref files matching the schema expected by
-the pipeline (PR #79): date, bb_ref, comm_bb_ref, ship_bb_ref.
+the pipeline: date, bb_ref, comm_bb_ref, ship_bb_ref.
 """
 
 import argparse
@@ -100,7 +100,7 @@ def find_earliest_data_date(s3_client, hydrophone: Hydrophone) -> dt.date | None
     resp = s3_client.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix, MaxKeys=1)
     if resp.get("KeyCount", 0) == 0:
         return None
-    # First key is the earliest (S3 lists lexicographically)
+    # First key is the earliest (S3 lists alphabetically by key)
     # e.g. .../year=2026/month=03/day=01/file.parquet
     key = resp["Contents"][0]["Key"]
     parts = key.split("/")
@@ -120,7 +120,10 @@ def find_earliest_data_date(s3_client, hydrophone: Hydrophone) -> dt.date | None
 def compute_bootstrap_reference(
     hydrophone: Hydrophone, earliest_date: dt.date
 ) -> tuple[float, float, float] | None:
-    """Compute 5th percentile over the first WINDOW_DAYS days of data."""
+    """Compute 5th percentile over the first WINDOW_DAYS days of data.
+
+    Used before there is enough data history to compute a rolling reference.
+    """
     start_time = dt.datetime.combine(earliest_date, dt.time.min)
     end_time = dt.datetime.combine(earliest_date + dt.timedelta(days=WINDOW_DAYS), dt.time.min)
 
