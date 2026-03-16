@@ -40,5 +40,24 @@ flowchart TB
     n20@{ shape: rounded}
 ```
 ### Note on Orca-hls-utils
-
 Currently using [this fork](https://github.com/ayushmall0710/orca-hls-utils/commit/18e72ed8f81391629ad64462172c56711134c970) of orca-hls-utils because of bugs in get_next_clip() and with time zone handling.
+
+
+## Automated pipeline for ship monitor data to ship metrics parquet files
+
+see git_action_ship_metrics_upload.py
+
+### Purpose
+
+The purpose of this GitHub Actions workflow is to asynchronously automate the process of combining broadband sound data with ship monitoring data to calculate ship metrics and publish the resulting Parquet files to an S3 bucket. These stored ship metrics enable further analysis of ship noise within the Orcasound Lab monitoring area.
+
+### Script/Workflow Features
+
+* Load ship tracking data. The start_time and end_time are parsed from the weekly .zip file provided by M2. They are typically defined as follows, though they may vary slightly depending on the source file:
+    - start_time: current_date - 8 days
+    - end_time: current_date - 1 day
+* Load sound broadband data between start_time and end_time
+* Calculate metrics
+    - Sound related metrics will be None if there are no sound data between start_time and end_time
+* Upload to S3 and bookmark the last processed time
+
