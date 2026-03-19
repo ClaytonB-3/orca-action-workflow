@@ -25,6 +25,7 @@ from orcasound_noise.utils import Hydrophone
 
 WINDOW_DAYS = 7
 TARGET_ROWS = WINDOW_DAYS * 24 * 60 * 60  # 604,800 seconds of data
+MIN_ROWS = 24 * 60 * 60  # 86,400 — require at least 1 day of data
 MAX_LOOKBACK_DAYS = 14
 TIMEZONE = ZoneInfo("US/Pacific")
 
@@ -108,10 +109,17 @@ def compute_reference(
     # Take only the most recent TARGET_ROWS
     bb_df = bb_df.sort(TIMESTAMP_COL, descending=True).head(TARGET_ROWS)
 
+    if bb_df.height < MIN_ROWS:
+        print(
+            f"  Skipping {name}: only {bb_df.height} rows found "
+            f"(need at least {MIN_ROWS}) — not enough data for a reliable reference"
+        )
+        return None
+
     if bb_df.height < TARGET_ROWS:
         print(
             f"  WARNING: only {bb_df.height}/{TARGET_ROWS} rows found after "
-            f"{MAX_LOOKBACK_DAYS}d lookback for {name} — significant data gap likely"
+            f"{MAX_LOOKBACK_DAYS}d lookback for {name} — using available data"
         )
     else:
         print(f"  Collected {bb_df.height} rows")
