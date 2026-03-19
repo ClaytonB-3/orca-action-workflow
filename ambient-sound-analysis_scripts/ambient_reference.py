@@ -25,7 +25,7 @@ from orcasound_noise.utils import Hydrophone
 
 WINDOW_DAYS = 7
 TARGET_ROWS = WINDOW_DAYS * 24 * 60 * 60  # 604,800 seconds of data
-MIN_ROWS = 24 * 60 * 60  # 86,400 — require at least 1 day of data
+MIN_ROWS = TARGET_ROWS  # require a full 7 days of data
 MAX_LOOKBACK_DAYS = 14
 TIMEZONE = ZoneInfo("US/Pacific")
 
