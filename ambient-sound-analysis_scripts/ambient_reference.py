@@ -87,17 +87,6 @@ def load_broadband(hydrophone: Hydrophone, start: dt.datetime, end: dt.datetime)
         return None
 
 
-def compute_quantiles(bb_df: pl.DataFrame) -> tuple[float, float, float]:
-    """Compute 5th percentile for the three broadband bands."""
-    quantiles = bb_df.select(
-        pl.col(BB_COL).quantile(0.05).alias("bb_ref"),
-        pl.col(COMM_BB_COL).quantile(0.05).alias("comm_bb_ref"),
-        pl.col(SHIP_BB_COL).quantile(0.05).alias("ship_bb_ref"),
-    ).row(0)
-    return (float(quantiles[0]), float(quantiles[1]), float(quantiles[2]))
-
-
-
 def compute_reference(
     hydrophone: Hydrophone, now: dt.datetime, ref_date: dt.date
 ) -> ReferenceRow | None:
@@ -127,12 +116,16 @@ def compute_reference(
     else:
         print(f"  Collected {bb_df.height} rows")
 
-    quantiles = compute_quantiles(bb_df)
+    quantiles = bb_df.select(
+        pl.col(BB_COL).quantile(0.05).alias("bb_ref"),
+        pl.col(COMM_BB_COL).quantile(0.05).alias("comm_bb_ref"),
+        pl.col(SHIP_BB_COL).quantile(0.05).alias("ship_bb_ref"),
+    ).row(0)
     return ReferenceRow(
         date=ref_date,
-        bb_ref=quantiles[0],
-        comm_bb_ref=quantiles[1],
-        ship_bb_ref=quantiles[2],
+        bb_ref=float(quantiles[0]),
+        comm_bb_ref=float(quantiles[1]),
+        ship_bb_ref=float(quantiles[2]),
     )
 
 
